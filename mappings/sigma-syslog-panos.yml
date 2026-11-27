@@ -1,0 +1,23 @@
+---
+name: PAN-OS Traffic syslog
+kind: json
+rules: sigma
+groups:
+  - name: PAN-OS Traffic
+    timestamp: timestamp
+    filter:
+      panos.type: TRAFFIC
+    fields:
+      - {from: Action, to: panos.action}
+      - {from: SourceIp, to: panos.src}
+      - {from: SourcePort, to: panos.sport}
+      - {from: DestinationIp, to: panos.dst}
+      - {from: DestinationPort, to: panos.dport}
+      - {from: Protocol, to: panos.proto}
+      - {from: Application, to: panos.app, visible: false}
+      - {from: RuleName, to: panos.rule, visible: false}
+      - {from: src_ip, to: panos.src, visible: false}
+      - {from: dst_ip, to: panos.dst, visible: false}
+      - {from: src_port, to: panos.sport, visible: false}
+      - {from: dst_port, to: panos.dport, visible: false}
+      - {from: action, to: panos.action, visible: false}

@@ -1,0 +1,16 @@
+---
+name: Generic syslog
+kind: json
+rules: sigma
+groups:
+  - name: Syslog
+    timestamp: timestamp
+    filter:
+      syslog.format: [rfc3164, rfc5424]
+    fields:
+      - {from: Computer, to: syslog.hostname}
+      - {from: Application, to: syslog.appname}
+      - {from: Message, to: message}
+      - {from: ProcessId, to: syslog.procid, visible: false}
+      - {from: Facility, to: syslog.facility, visible: false}
+      - {from: Severity, to: syslog.severity, visible: false}

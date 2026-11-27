@@ -1,8 +1,8 @@
 [package]
 name = "chainsaw"
-version = "2.18.0"
-repository = "https://github.com/WithSecureLabs/chainsaw"
-description = "Rapidly Search and Hunt Through Windows Forensic Artefacts"
+version = "2.19.0-mengoh.1"
+repository = "https://github.com/Mengoh-Labs/chainsaw-plus-plus"
+description = "Chainsaw++ defensive hunting across endpoint, cloud and firewall logs"
 authors = ["James Dorgan <james@dorgan.io>","Alex Kornitzer <alex.kornitzer@withsecure.com>"]
 readme = "README.md"
 license = "GPL3"
@@ -19,6 +19,8 @@ chrono = "0.4"
 chrono-tz = { version = "0.10", features = ["serde"] }
 clap = { version = "4.0", features = ["derive"] }
 crossterm = "0.29"
+csv = "1"
+flate2 = "1"
 evtx = { version = "0.15", default-features = false }
 indicatif = "0.18"
 lazy_static = "1.4.0"
@@ -36,6 +38,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["raw_value"] }
 serde_yaml = "0.9"
 smallvec = "1.11"
+syslog_loose = "0.23"
 tau-engine = { version = "1.0", features = ["core", "json", "sync"] }
 tempfile = "3.2"
 terminal_size = "0.4"

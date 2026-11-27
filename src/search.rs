@@ -48,15 +48,11 @@ impl Iterator for Iter<'_> {
             if let Some(ref field) = self.searcher.timestamp
                 && (self.searcher.from.is_some() || self.searcher.to.is_some())
             {
-                // TODO: Default to RFC 3339
                 let result = match &document {
                     Document::Evtx(evtx) => {
                         match crate::evtx::WrapperLegacy(&evtx.data).find(field) {
                             Some(value) => match value.as_str() {
-                                Some(timestamp) => NaiveDateTime::parse_from_str(
-                                    timestamp,
-                                    "%Y-%m-%dT%H:%M:%S%.6fZ",
-                                ),
+                                Some(timestamp) => crate::file::event_time(timestamp),
                                 None => continue,
                             },
                             None => continue,
@@ -68,9 +64,7 @@ impl Iterator for Iter<'_> {
                     | Document::Mft(json)
                     | Document::Esedb(json) => match json.find(field) {
                         Some(value) => match value.as_str() {
-                            Some(timestamp) => {
-                                NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%dT%H:%M:%S%.fZ")
-                            }
+                            Some(timestamp) => crate::file::event_time(timestamp),
                             None => continue,
                         },
                         None => continue,

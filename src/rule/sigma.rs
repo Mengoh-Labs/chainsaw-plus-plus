@@ -1,7 +1,6 @@
+use anyhow::Context;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
-use std::io::prelude::*;
 use std::path::Path;
 
 use anyhow::Result;
@@ -16,14 +15,33 @@ use super::{Level, Status};
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub struct Rule {
-    #[serde(alias = "title")]
-    pub name: String,
+    #[serde(flatten)]
+    pub metadata: Metadata,
     #[serde(flatten)]
     pub tau: Tau,
-
     #[serde(default)]
     pub aggregate: Option<super::Aggregate>,
+}
 
+impl std::ops::Deref for Rule {
+    type Target = Metadata;
+    fn deref(&self) -> &Metadata {
+        &self.metadata
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct Metadata {
+    #[serde(skip)]
+    pub(crate) origin: std::path::PathBuf,
+    #[serde(skip)]
+    pub(crate) filtered: bool,
+    #[serde(alias = "title")]
+    pub name: String,
+    #[serde(default)]
+    pub component_name: Option<String>,
+    #[serde(default)]
+    pub generate: bool,
     pub authors: Vec<String>,
     pub description: String,
     pub level: Level,
@@ -89,7 +107,12 @@ struct Detection {
 #[derive(Clone, Deserialize)]
 struct Header {
     pub title: String,
+    #[serde(default)]
     pub description: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub generate: bool,
     #[serde(default)]
     pub action: Option<String>,
     #[serde(default)]
@@ -135,6 +158,12 @@ impl Sigma {
         let mut tau = Mapping::new();
         let header = self.header.clone()?;
         tau.insert("title".into(), header.title.into());
+        if let Some(name) = header.name {
+            tau.insert("component_name".into(), name.into());
+        }
+        if header.generate {
+            tau.insert("generate".into(), true.into());
+        }
         tau.insert("description".into(), header.description.into());
         if let Some(status) = header.status {
             let status = match status.as_str() {
@@ -927,23 +956,65 @@ fn detections_to_tau(detection: Detection) -> Result<Mapping> {
 }
 
 pub fn load(rule: &Path) -> Result<Vec<Yaml>> {
-    let regex = Regex::new(r"---\s*\n").expect("invalid regex");
-    let mut file = File::open(rule)?;
-    let mut contents = String::new();
-    file.read_to_string(&mut contents)?;
-
-    let mut sigma: Vec<Sigma> = regex
-        .split(&contents)
-        .filter_map(|p| {
-            if !p.is_empty() {
-                serde_yaml::from_str::<Sigma>(p).ok()
+    let contents = std::fs::read_to_string(rule)?;
+    let mut components = vec![];
+    let mut correlations = vec![];
+    for document in serde_yaml::Deserializer::from_str(&contents) {
+        let raw = Yaml::deserialize(document).map_err(|e| {
+            if contents
+                .lines()
+                .any(|l| l.trim_start().starts_with("correlation:"))
+            {
+                anyhow!(super::CorrelationError(e.to_string()))
             } else {
-                None
+                anyhow!(e)
             }
-        })
-        .collect();
+        })?;
+        if raw.is_null() {
+            continue;
+        }
+        if let Some(definition) = raw.get("correlation") {
+            let parse = || -> Result<Yaml> {
+                anyhow::ensure!(
+                    raw.get("detection").is_none(),
+                    "both detection and correlation were supplied"
+                );
+                let sigma: Sigma = serde_yaml::from_value(raw.clone())?;
+                let mut base = sigma.as_base().context("correlation requires a title")?;
+                base.insert(
+                    "level".into(),
+                    sigma.level.unwrap_or_else(|| "info".to_string()).into(),
+                );
+                base.insert("correlation".into(), definition.clone());
+                Ok(base.into())
+            };
+            correlations.push(parse().map_err(|e| super::CorrelationError(e.to_string()))?);
+        } else {
+            components.push(raw);
+        }
+    }
+    let has_correlation = !correlations.is_empty();
+    let load_components = || -> Result<Vec<Yaml>> {
+        let rules = components
+            .into_iter()
+            .map(serde_yaml::from_value)
+            .collect::<Result<Vec<Sigma>, _>>()?;
+        convert_components(rules)
+    };
+    let mut rules = load_components().map_err(|e| {
+        if has_correlation {
+            anyhow!(super::CorrelationError(format!(
+                "invalid correlation component: {e:#}"
+            )))
+        } else {
+            e
+        }
+    })?;
+    rules.extend(correlations);
+    Ok(rules)
+}
 
-    // Silently error if we found no sigma rules.
+fn convert_components(mut sigma: Vec<Sigma>) -> Result<Vec<Yaml>> {
     if sigma.is_empty() {
         return Ok(vec![]);
     }

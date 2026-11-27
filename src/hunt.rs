@@ -1,10 +1,14 @@
+mod correlation;
+
+pub use correlation::CorrelationState;
+
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use chrono_tz::Tz;
@@ -79,8 +83,10 @@ pub struct Detections<'a> {
 }
 
 //#[derive(Debug, Serialize)]
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Document<'a> {
+    pub record_index: Option<usize>,
+    pub(crate) source_hunt: Option<Uuid>,
     pub kind: FileKind,
     pub path: &'a Path,
     // NOTE: Serialised Value using bincode.
@@ -92,8 +98,11 @@ impl Serialize for Document<'_> {
     where
         S: Serializer,
     {
-        // 3 is the number of fields in the struct.
-        let mut state = serializer.serialize_struct("Document", 3)?;
+        let mut state = serializer
+            .serialize_struct("Document", 3 + usize::from(self.record_index.is_some()))?;
+        if let Some(index) = self.record_index {
+            state.serialize_field("record_index", &index)?;
+        }
         state.serialize_field("kind", &self.kind)?;
         state.serialize_field("path", &self.path)?;
         let (value, _) =
@@ -181,6 +190,7 @@ impl HunterBuilder {
             }
             None => BTreeMap::new(),
         };
+        let correlations = correlation::Bindings::resolve(&rules)?;
         if let Some(mut mappings) = self.mappings {
             cs_trace!("[*] Loading mappings...");
             mappings.sort();
@@ -325,6 +335,7 @@ impl HunterBuilder {
                             }
                         }
                     }
+                    Rule::Correlation(_) => {}
                     Rule::Sigma(s) => {
                         if let Some(a) = &s.aggregate {
                             keys.extend(a.fields.iter().cloned());
@@ -423,6 +434,7 @@ impl HunterBuilder {
                             };
                             Rule::Chainsaw(c)
                         }
+                        Rule::Correlation(c) => Rule::Correlation(c),
                         Rule::Sigma(mut s) => {
                             if let Some(a) = s.aggregate.as_mut() {
                                 a.fields = a
@@ -487,6 +499,7 @@ impl HunterBuilder {
 
         Ok(Hunter {
             inner: HunterInner {
+                correlations,
                 hunts,
                 fields,
                 rules,
@@ -750,6 +763,7 @@ impl Hunt {
 }
 
 pub struct HunterInner {
+    correlations: correlation::Bindings,
     hunts: Vec<Hunt>,
     fields: Vec<String>,
     rules: BTreeMap<Uuid, Rule>,
@@ -775,6 +789,31 @@ impl Hunter {
         file: &'a Path,
         cache: &Option<std::fs::File>,
     ) -> crate::Result<Vec<Detections<'a>>> {
+        let mut state = self.correlation_state();
+        let mut detections = self.hunt_with_state(file, cache, &mut state)?;
+        detections.extend(self.finish_correlations(state)?);
+        Ok(detections)
+    }
+
+    /// Begin a hunt spanning multiple files. Finish once all files have been scanned.
+    pub fn correlation_state<'a>(&self) -> CorrelationState<'a> {
+        CorrelationState::default()
+    }
+
+    pub fn finish_correlations<'a>(
+        &self,
+        state: CorrelationState<'a>,
+    ) -> crate::Result<Vec<Detections<'a>>> {
+        state.finish(self.rules())
+    }
+
+    pub fn hunt_with_state<'a>(
+        &'a self,
+        file: &'a Path,
+        cache: &Option<std::fs::File>,
+        state: &mut CorrelationState<'a>,
+    ) -> crate::Result<Vec<Detections<'a>>> {
+        let observations = Mutex::new(CorrelationState::default());
         let mut reader = Reader::load(
             file,
             self.inner.load_unknown,
@@ -793,8 +832,9 @@ impl Hunter {
         let offset = Mutex::new(0);
         let mut detections = reader
             .documents()
+            .enumerate()
             .par_bridge()
-            .filter_map(|document| {
+            .filter_map(|(record_index, document)| {
                 let document_id = Uuid::new_v4();
                 let document = match document {
                     Ok(document) => document,
@@ -841,6 +881,7 @@ impl Hunter {
                     }
                 };
                 let mut hits = smallvec::smallvec![];
+                let mut evidence = None;
                 for hunt in &self.inner.hunts {
                     if hunt.file != kind {
                         continue;
@@ -870,13 +911,16 @@ impl Hunter {
                         }
                     };
 
+                    if let HuntKind::Group { filter, .. } = &hunt.kind
+                        && !tau_engine::core::solve(filter, &mapped)
+                    {
+                        continue;
+                    }
+
                     let timestamp = match mapped.find(&hunt.timestamp) {
                         Some(value) => match value.as_str() {
                             Some(timestamp) => {
-                                match NaiveDateTime::parse_from_str(
-                                    timestamp,
-                                    "%Y-%m-%dT%H:%M:%S%.fZ",
-                                ) {
+                                match crate::file::event_time(timestamp) {
                                     Ok(t) => t,
                                     Err(e) => {
                                         if self.inner.skip_errors {
@@ -908,16 +952,15 @@ impl Hunter {
                     match &hunt.kind {
                         HuntKind::Group {
                             exclusions,
-                            filter,
-                            kind,
+                            filter: _,
+                            kind: rule_kind,
                             preconditions,
                         } => {
-                            if tau_engine::core::solve(filter, &mapped) {
                                 let rules = self.inner.rules.iter().collect::<Vec<(_, _)>>();
                                 let matches = rules
                                     .iter()
                                     .filter_map(|(rid, rule)| {
-                                        if !rule.is_kind(kind) {
+                                        if !rule.is_kind(rule_kind) {
                                             return None;
                                         }
                                         if exclusions.contains(rid) {
@@ -935,6 +978,25 @@ impl Hunter {
                                     })
                                     .collect::<Vec<(_, _)>>();
                                 for (rid, rule) in matches {
+                                    if let Some(bindings) = self.inner.correlations.by_component.get(rid) {
+                                        let evidence = match &evidence {
+                                            Some(doc) => doc,
+                                            None => {
+                                                let data = match bincode::serde::encode_to_vec(&value, bincode::config::standard()) {
+                                                    Ok(data) => data,
+                                                    Err(e) => return Some(Err(e.into())),
+                                                };
+                                                evidence.insert(Arc::new(Document { kind: kind.clone(), path: file, record_index: Some(record_index + 1), source_hunt: None, data }))
+                                            }
+                                        };
+                                        let mut observations = observations.lock().expect("could not lock correlation observations");
+                                        for &(id, component) in bindings {
+                                            if exclusions.contains(&id) { continue; }
+                                            let Rule::Correlation(c) = &self.inner.rules[&id] else { unreachable!() };
+                                            observations.observe(id, c, component, mapped.mapped, timestamp, hunt.id, evidence);
+                                        }
+                                    }
+                                    if self.inner.correlations.hidden.contains(rid) { continue; }
                                     if let Some(aggregate) = &rule.aggregate() {
                                         let mut files = files.lock().expect("could not lock files");
                                         files.insert(document_id, (value.clone(), timestamp));
@@ -969,7 +1031,6 @@ impl Hunter {
                                         });
                                     }
                                 }
-                            }
                         }
                         HuntKind::Rule { aggregate, filter } => {
                             let hit = match &filter {
@@ -1045,6 +1106,7 @@ impl Hunter {
                             hits,
                             kind: Kind::Individual {
                                 document: Document {
+                                    record_index: None, source_hunt: None,
                                     kind,
                                     path: file,
                                     data: bincode::serde::encode_to_vec(&value, bincode::config::standard()).ok()?,
@@ -1075,6 +1137,8 @@ impl Hunter {
                     for id in ids {
                         let (value, timestamp) = files.get(id).expect("could not get document");
                         documents.push(Document {
+                            record_index: None,
+                            source_hunt: None,
                             kind: kind.clone(),
                             path: file,
                             data: bincode::serde::encode_to_vec(
@@ -1099,6 +1163,11 @@ impl Hunter {
                 }
             }
         }
+        state.extend(
+            observations
+                .into_inner()
+                .expect("could not lock correlation observations"),
+        );
         Ok(detections)
     }
 

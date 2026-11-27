@@ -1,0 +1,23 @@
+name: macOS Unified Log
+kind: json
+rules: sigma
+groups:
+  - name: macOS Unified Log
+    timestamp: timestamp
+    filter:
+      eventType: "*"
+    fields:
+      - from: eventType
+        to: eventType
+      - from: timestamp
+        to: timestamp
+      - from: eventMessage
+        to: eventMessage
+      - from: subsystem
+        to: subsystem
+      - from: category
+        to: category
+      - from: processImagePath
+        to: processImagePath
+      - from: processID
+        to: processID

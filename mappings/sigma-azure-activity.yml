@@ -1,0 +1,48 @@
+---
+name: Azure Activity Log
+kind: json
+rules: sigma
+
+groups:
+  - name: Azure Activity Log (storage and Event Hubs)
+    timestamp: time
+    filter:
+      resourceId: "/*"
+      operationName: "*"
+      category:
+        - Administrative
+        - ServiceHealth
+        - ResourceHealth
+        - Alert
+        - Autoscale
+        - Recommendation
+        - Security
+        - Policy
+        - Write
+        - Delete
+        - Action
+    fields:
+      - name: operationName
+      - name: resourceId
+      - name: resultType
+      - name: correlationId
+      - from: principalId
+        to: identity.authorization.evidence.principalId
+
+  - name: Azure Activity Log (REST and CLI)
+    timestamp: eventTimestamp
+    filter:
+      - resourceId: "/*"
+        operationName: "*"
+      - id: "i?^/(subscriptions|providers)/.+/events/[^/]+/ticks/[0-9]+$"
+        operationName: "*"
+    fields:
+      - from: operationName
+        to: operationName.value
+      - name: caller
+      - name: resourceId
+      - from: resultType
+        to: status.value
+      - name: correlationId
+      - name: eventDataId
+      - name: id
