@@ -2,7 +2,7 @@
 <div align="center">
  <p>
   <h1>
-   Rapidly Search and Hunt through Windows Forensic Artefacts
+   Chainsaw++ · hunt endpoint, cloud and firewall logs
   </h1>
  </p>
 <img style="padding:0;vertical-align:bottom;" height="76" width="300" src="images/chainsaw.png"/>
@@ -10,6 +10,39 @@
 
 ---
 Chainsaw provides a powerful ‘first-response’ capability to quickly identify threats within Windows forensic artefacts such as Event Logs and the MFT file. Chainsaw offers a generic and fast method of searching through event logs for keywords, and by identifying threats using built-in support for Sigma detection rules, and via custom Chainsaw detection rules.
+
+## Mengoh Labs fork
+
+Chainsaw++ extends [WithSecure Chainsaw](https://github.com/WithSecureOpenSource/chainsaw). The Cargo binary remains named `chainsaw`. To keep a separate local command, build the fork and install it under its own name.
+
+```sh
+cargo build --release --locked
+mkdir -p ~/.local/bin
+install -m 755 target/release/chainsaw ~/.local/bin/chainsaw-plus-plus
+```
+
+Use the mapping for the source being hunted and point `--sigma` at the relevant rules. Supply referenced Sigma component rules and the correlation definition together. A single hunt invocation can correlate matching events across its input files. Choose inputs from the same investigation and include a suitable group key, such as host or user, when events must belong to the same entity.
+
+```sh
+chainsaw-plus-plus hunt captures/ --sigma rules-for-this-hunt/ --mapping mappings/sigma-event-logs-all.yml --jsonl
+chainsaw-plus-plus hunt auth.syslog --sigma linux-rules/ --mapping mappings/sigma-syslog-linux-sysmon.yml --jsonl
+chainsaw-plus-plus hunt system.logarchive --sigma mac-rules/ --mapping mappings/sigma-macos-unified.yml --jsonl
+```
+
+| Source | Input | Sigma mapping in `mappings/` |
+| --- | --- | --- |
+| Windows Sysmon | EVTX Operational channel | `sigma-event-logs-all.yml` |
+| Syslog | RFC 3164 or 5424, one record per line | `sigma-syslog.yml` |
+| Linux Sysmon | Syslog with an XML event payload | `sigma-syslog-linux-sysmon.yml` |
+| Palo Alto Networks | PAN-OS Traffic syslog or standard Traffic CSV records in a log file | `sigma-syslog-panos.yml` |
+| macOS Unified Log | JSONL, NDJSON, or a native `.logarchive` directory on macOS | `sigma-macos-unified.yml` |
+| AWS CloudTrail | Delivery JSON or gzip, with or without a gzip filename | `sigma-cloudtrail-logs-all.yml` |
+| Azure Activity Log | REST API pages, diagnostic export records, or line-delimited storage blobs | `sigma-azure-activity.yml` |
+| Google Cloud Audit Logs | Cloud Logging API entries, CLI arrays or JSONL | `sigma-google-cloud-audit.yml` |
+
+The correlation engine supports Sigma `temporal`, `temporal_ordered` and `value_count`. References resolve to component rules by Sigma name or ID. Time windows include their endpoints. Ordered matches require distinct source records and strictly increasing timestamps. For a distinct-value threshold, the engine emits on entry into a qualifying window and includes a representative record for each distinct value. JSON and JSONL expose the contributing documents. Use separate invocations for independent captures when a same-named host could appear in both. Chained correlations and explicit count conditions on ordered rules currently return a diagnostic.
+
+RFC 3164 headers without a year or timezone use the input file's modification year and UTC. Check the event's `timestamp_source` before correlating historical captures. On macOS, archive decoding uses Apple's `/usr/bin/log show` and temporary disk space for the decoded NDJSON. For analysis on Linux or Windows, export the records on a Mac first using `log show --archive system.logarchive --style ndjson --info --debug --signpost > system.ndjson`.
 
 ## Features
 

@@ -1,0 +1,57 @@
+---
+name: Sysmon for Linux syslog
+kind: json
+rules: sigma
+extensions:
+  preconditions:
+    - for: {logsource.category: process_creation}
+      filter: {int(EventID): 1}
+    - for: {logsource.category: network_connection}
+      filter: {int(EventID): 3}
+    - for: {logsource.category: process_termination}
+      filter: {int(EventID): 5}
+    - for: {logsource.category: file_event}
+      filter: {int(EventID): 11}
+    - for: {logsource.category: file_delete}
+      filter: {int(EventID): 23}
+    - for: {logsource.category: file_delete_detected}
+      filter: {int(EventID): 26}
+    - for: {logsource.product: windows}
+      filter: {Provider: Microsoft-Windows-Sysmon}
+groups:
+  - name: Sysmon for Linux
+    timestamp: timestamp
+    filter:
+      Provider: Linux-Sysmon
+    fields:
+      - {from: Provider, to: Event.System.Provider_attributes.Name, visible: false}
+      - {from: EventID, to: Event.System.EventID}
+      - {from: Computer, to: Event.System.Computer}
+      - {from: User, to: Event.EventData.User}
+      - {from: Image, to: Event.EventData.Image}
+      - {from: CommandLine, to: Event.EventData.CommandLine}
+      - {from: ProcessId, to: Event.EventData.ProcessId, visible: false}
+      - {from: ProcessGuid, to: Event.EventData.ProcessGuid, visible: false}
+      - {from: RuleName, to: Event.EventData.RuleName, visible: false}
+      - {from: UtcTime, to: Event.EventData.UtcTime, visible: false}
+      - {from: CurrentDirectory, to: Event.EventData.CurrentDirectory, visible: false}
+      - {from: LogonGuid, to: Event.EventData.LogonGuid, visible: false}
+      - {from: LogonId, to: Event.EventData.LogonId, visible: false}
+      - {from: IntegrityLevel, to: Event.EventData.IntegrityLevel, visible: false}
+      - {from: TerminalSessionId, to: Event.EventData.TerminalSessionId, visible: false}
+      - {from: ParentImage, to: Event.EventData.ParentImage, visible: false}
+      - {from: ParentProcessId, to: Event.EventData.ParentProcessId, visible: false}
+      - {from: ParentProcessGuid, to: Event.EventData.ParentProcessGuid, visible: false}
+      - {from: ParentCommandLine, to: Event.EventData.ParentCommandLine, visible: false}
+      - {from: ParentUser, to: Event.EventData.ParentUser, visible: false}
+      - {from: Hashes, to: Event.EventData.Hashes, visible: false}
+      - {from: Protocol, to: Event.EventData.Protocol, visible: false}
+      - {from: Initiated, to: Event.EventData.Initiated, visible: false}
+      - {from: SourceIp, to: Event.EventData.SourceIp, visible: false}
+      - {from: SourcePort, to: Event.EventData.SourcePort, visible: false}
+      - {from: SourceHostname, to: Event.EventData.SourceHostname, visible: false}
+      - {from: DestinationIp, to: Event.EventData.DestinationIp, visible: false}
+      - {from: DestinationPort, to: Event.EventData.DestinationPort, visible: false}
+      - {from: DestinationHostname, to: Event.EventData.DestinationHostname, visible: false}
+      - {from: TargetFilename, to: Event.EventData.TargetFilename, visible: false}
+      - {from: CreationUtcTime, to: Event.EventData.CreationUtcTime, visible: false}

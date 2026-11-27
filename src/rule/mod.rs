@@ -18,20 +18,40 @@ pub use self::chainsaw::Rule as Chainsaw;
 pub use self::sigma::Rule as Sigma;
 
 pub mod chainsaw;
+pub mod correlation;
+pub use correlation::CorrelationError;
 pub mod sigma;
 
 #[derive(Clone, Debug)]
 pub enum Rule {
     Chainsaw(Chainsaw),
     Sigma(Sigma),
+    Correlation(correlation::Rule),
 }
 
 impl Rule {
+    pub(crate) fn sigma_metadata(&self) -> Option<&sigma::Metadata> {
+        match self {
+            Self::Sigma(s) => Some(&s.metadata),
+            Self::Correlation(c) => Some(&c.metadata),
+            Self::Chainsaw(_) => None,
+        }
+    }
+
+    pub(crate) fn authors(&self) -> &Vec<String> {
+        match self {
+            Self::Chainsaw(c) => &c.authors,
+            Self::Sigma(s) => &s.authors,
+            Self::Correlation(c) => &c.metadata.authors,
+        }
+    }
+
     #[inline]
     pub fn aggregate(&self) -> &Option<Aggregate> {
         match self {
             Self::Chainsaw(c) => &c.aggregate,
             Self::Sigma(s) => &s.aggregate,
+            Self::Correlation(_) => &None,
         }
     }
 
@@ -39,7 +59,7 @@ impl Rule {
     pub fn is_kind(&self, kind: &Kind) -> bool {
         match self {
             Self::Chainsaw(_) => kind == &Kind::Chainsaw,
-            Self::Sigma(_) => kind == &Kind::Sigma,
+            Self::Sigma(_) | Self::Correlation(_) => kind == &Kind::Sigma,
         }
     }
 
@@ -48,6 +68,7 @@ impl Rule {
         match self {
             Self::Chainsaw(c) => &c.level,
             Self::Sigma(s) => &s.level,
+            Self::Correlation(c) => &c.metadata.level,
         }
     }
 
@@ -55,7 +76,7 @@ impl Rule {
     pub fn types(&self) -> &FileKind {
         match self {
             Self::Chainsaw(c) => &c.kind,
-            Self::Sigma(_) => &FileKind::Unknown,
+            Self::Sigma(_) | Self::Correlation(_) => &FileKind::Unknown,
         }
     }
 
@@ -64,6 +85,7 @@ impl Rule {
         match self {
             Self::Chainsaw(c) => &c.name,
             Self::Sigma(s) => &s.name,
+            Self::Correlation(c) => &c.metadata.name,
         }
     }
 
@@ -75,6 +97,7 @@ impl Rule {
                 Filter::Expression(expression) => tau_engine::core::solve(expression, document),
             },
             Self::Sigma(s) => tau_engine::solve(&s.tau.detection, document),
+            Self::Correlation(_) => false,
         }
     }
 
@@ -83,6 +106,7 @@ impl Rule {
         match self {
             Self::Chainsaw(c) => &c.status,
             Self::Sigma(s) => &s.status,
+            Self::Correlation(c) => &c.metadata.status,
         }
     }
 }
@@ -139,6 +163,7 @@ pub enum Level {
     High,
     Medium,
     Low,
+    #[serde(alias = "informational")]
     Info,
 }
 
@@ -205,6 +230,28 @@ pub fn load(
     levels: &Option<HashSet<Level>>,
     statuses: &Option<HashSet<Status>>,
 ) -> crate::Result<Vec<Rule>> {
+    load_rules(kind, path, kinds, levels, statuses, false)
+}
+
+/// Keep component definitions available while selecting the alerts shown by hunt.
+pub fn load_for_hunt(
+    kind: Kind,
+    path: &Path,
+    kinds: &Option<HashSet<Kind>>,
+    levels: &Option<HashSet<Level>>,
+    statuses: &Option<HashSet<Status>>,
+) -> crate::Result<Vec<Rule>> {
+    load_rules(kind, path, kinds, levels, statuses, true)
+}
+
+fn load_rules(
+    kind: Kind,
+    path: &Path,
+    kinds: &Option<HashSet<Kind>>,
+    levels: &Option<HashSet<Level>>,
+    statuses: &Option<HashSet<Status>>,
+    retain_dependencies: bool,
+) -> crate::Result<Vec<Rule>> {
     if let Some(x) = path.extension()
         && x != "yml"
         && x != "yaml"
@@ -227,19 +274,24 @@ pub fn load(
             {
                 return Ok(vec![]);
             }
-            let sigma = match sigma::load(path)?
+            sigma::load(path)?
                 .into_iter()
-                .map(serde_yaml::from_value::<Sigma>)
-                .collect::<Result<Vec<_>, _>>()
-            {
-                Ok(rules) => rules,
-                Err(_) => {
-                    anyhow::bail!("failed to load rule, run the linter for more information");
-                }
-            };
-            sigma
-                .into_iter()
-                .map(|mut s| {
+                .map(|raw| -> crate::Result<Rule> {
+                    if let Some(definition) = raw.get("correlation") {
+                        let parse = || -> crate::Result<Rule> {
+                            let mut meta: sigma::Metadata = serde_yaml::from_value(raw.clone())?;
+                            meta.origin = path.to_owned();
+                            let generate = meta.generate;
+                            Ok(Rule::Correlation(correlation::Rule::parse(
+                                meta,
+                                definition.clone(),
+                                generate,
+                            )?))
+                        };
+                        return parse().map_err(|e| anyhow!(CorrelationError(e.to_string())));
+                    }
+                    let mut s: Sigma = serde_yaml::from_value(raw)?;
+                    s.metadata.origin = path.to_owned();
                     s.tau.detection.expression = optimiser::coalesce(
                         s.tau.detection.expression,
                         &s.tau.detection.identifiers,
@@ -249,17 +301,29 @@ pub fn load(
                     s.tau.detection.expression = optimiser::rewrite(s.tau.detection.expression);
                     // FIXME: Off until matrix optimisation is fixed upstream.
                     //s.tau.detection.expression = optimiser::matrix(s.tau.detection.expression);
-                    Rule::Sigma(s)
+                    Ok(Rule::Sigma(s))
                 })
-                .collect()
+                .collect::<crate::Result<Vec<_>>>()?
         }
     };
-    if let Some(levels) = levels.as_ref() {
-        rules.retain(|r| levels.contains(r.level()));
-    }
-    if let Some(statuses) = statuses.as_ref() {
-        rules.retain(|r| statuses.contains(r.status()));
-    }
+    rules.retain_mut(|r| {
+        let selected = levels.as_ref().is_none_or(|l| l.contains(r.level()))
+            && statuses.as_ref().is_none_or(|s| s.contains(r.status()));
+        if retain_dependencies {
+            match r {
+                Rule::Sigma(s) => {
+                    s.metadata.filtered = !selected;
+                    return true;
+                }
+                Rule::Correlation(c) => {
+                    c.metadata.filtered = !selected;
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        selected
+    });
     Ok(rules)
 }
 
@@ -279,25 +343,13 @@ pub fn lint(kind: &Kind, path: &Path) -> crate::Result<Vec<Filter>> {
                 anyhow::bail!("{}", e);
             }
         },
-        Kind::Sigma => match sigma::load(path) {
-            Ok(yamls) => {
-                let sigma = yamls
-                    .into_iter()
-                    .map(serde_yaml::from_value::<Sigma>)
-                    .collect::<Result<Vec<_>, _>>()?;
-                sigma
-                    .into_iter()
-                    .map(|r| Filter::Detection(r.tau.detection))
-                    .collect()
-            }
-            Err(e) => {
-                if let Some(source) = e.source() {
-                    anyhow::bail!("{} - {}", e, source);
-                } else {
-                    anyhow::bail!("{}", e);
-                }
-            }
-        },
+        Kind::Sigma => load(Kind::Sigma, path, &None, &None, &None)?
+            .into_iter()
+            .filter_map(|r| match r {
+                Rule::Sigma(s) => Some(Filter::Detection(s.tau.detection)),
+                _ => None,
+            })
+            .collect(),
     };
     Ok(detections)
 }

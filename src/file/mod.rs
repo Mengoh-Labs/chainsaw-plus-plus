@@ -18,7 +18,9 @@ pub mod esedb;
 pub mod evtx;
 pub mod hve;
 pub mod json;
+mod macos;
 pub mod mft;
+mod syslog;
 pub mod xml;
 
 #[derive(Clone)]
@@ -53,8 +55,21 @@ impl Kind {
         match self {
             Kind::Evtx => Some(vec!["evt".to_string(), "evtx".to_string()]),
             Kind::Hve => Some(vec!["hve".to_string()]),
-            Kind::Json => Some(vec!["json".to_string()]),
-            Kind::Jsonl => Some(vec!["jsonl".to_string()]),
+            Kind::Json => Some(
+                [
+                    "json",
+                    "jsonl",
+                    "ndjson",
+                    "gz",
+                    "log",
+                    "syslog",
+                    "logarchive",
+                ]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            ),
+            Kind::Jsonl => Some(vec!["jsonl".to_string(), "ndjson".to_string()]),
             Kind::Mft => Some(vec![
                 "mft".to_string(),
                 "bin".to_string(),
@@ -90,6 +105,8 @@ pub enum Parser {
     Hve(HveParser),
     Json(JsonParser),
     Jsonl(JsonlParser),
+    Archive(macos::Parser),
+    Syslog(syslog::Parser),
     Mft(MftParser),
     Xml(XmlParser),
     Esedb(EsedbParser),
@@ -108,6 +125,37 @@ impl Reader {
         decode_data_streams: bool,
         data_streams_directory: Option<PathBuf>,
     ) -> crate::Result<Self> {
+        let name = file.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        let extension = file.extension().and_then(|s| s.to_str());
+        if extension == Some("logarchive") {
+            return Self::from_parser(
+                macos::Parser::load(file).map(Parser::Archive),
+                file,
+                skip_errors,
+            );
+        }
+        if extension == Some("syslog") || matches!(name, "syslog" | "messages" | "secure") {
+            return Self::from_parser(
+                syslog::Parser::open(file).map(Parser::Syslog),
+                file,
+                skip_errors,
+            );
+        }
+        if extension == Some("log") {
+            match syslog::Parser::load(file) {
+                Ok(parser) => {
+                    return Ok(Self {
+                        parser: Parser::Syslog(parser),
+                    });
+                }
+                Err(_) if !load_unknown => {
+                    return Ok(Self {
+                        parser: Parser::Unknown,
+                    });
+                }
+                Err(_) => {} // Probe other formats when the caller requests it.
+            }
+        }
         // NOTE: We don't want to use libmagic because then we have to include databases etc... So
         // for now we assume that the file extensions are correct!
         match file.extension().and_then(|e| e.to_str()) {
@@ -134,6 +182,12 @@ impl Reader {
                         parser: Parser::Evtx(parser),
                     })
                 }
+                "gz" => Self::from_parser(
+                    JsonParser::load_gzip(file)
+                        .map(|parser| parser.map_or(Parser::Unknown, Parser::Json)),
+                    file,
+                    skip_errors,
+                ),
                 "json" => {
                     let parser = match JsonParser::load(file) {
                         Ok(parser) => parser,
@@ -156,7 +210,7 @@ impl Reader {
                         parser: Parser::Json(parser),
                     })
                 }
-                "jsonl" => {
+                "jsonl" | "ndjson" => {
                     let parser = match JsonlParser::load(file) {
                         Ok(parser) => parser,
                         Err(e) => {
@@ -382,6 +436,25 @@ impl Reader {
         }
     }
 
+    fn from_parser(
+        result: crate::Result<Parser>,
+        path: &Path,
+        skip_errors: bool,
+    ) -> crate::Result<Self> {
+        match result {
+            Ok(parser) => Ok(Self { parser }),
+            Err(error) if skip_errors => {
+                cs_eyellowln!("[!] failed to load '{}' - {}", path.display(), error);
+                Ok(Self {
+                    parser: Parser::Unknown,
+                })
+            }
+            Err(error) => {
+                Err(error).with_context(|| format!("failed to load '{}'", path.display()))
+            }
+        }
+    }
+
     pub fn documents<'a>(&'a mut self) -> Documents<'a> {
         let iterator = match &mut self.parser {
             Parser::Evtx(parser) => Box::new(
@@ -394,6 +467,8 @@ impl Reader {
                 as Box<dyn Iterator<Item = crate::Result<Document>> + Send + 'a>,
             Parser::Json(parser) => Box::new(parser.parse().map(|r| r.map(Document::Json)))
                 as Box<dyn Iterator<Item = crate::Result<Document>> + Send + 'a>,
+            Parser::Archive(parser) => Box::new(parser.parse().map(|r| r.map(Document::Json))),
+            Parser::Syslog(parser) => Box::new(parser.parse().map(|r| r.map(Document::Json))),
             Parser::Jsonl(parser) => Box::new(parser.parse().map(|r| r.map(Document::Json)))
                 as Box<dyn Iterator<Item = crate::Result<Document>> + Send + 'a>,
             Parser::Mft(parser) => Box::new(parser.parse().map(|r| r.map(Document::Mft)))
@@ -425,6 +500,7 @@ impl Reader {
             Parser::Hve(_) => Kind::Hve,
             Parser::Json(_) => Kind::Json,
             Parser::Jsonl(_) => Kind::Jsonl,
+            Parser::Archive(_) | Parser::Syslog(_) => Kind::Json,
             Parser::Mft(_) => Kind::Mft,
             Parser::Xml(_) => Kind::Xml,
             Parser::Esedb(_) => Kind::Esedb,
@@ -451,7 +527,14 @@ pub fn get_files(
                 }
             }
         };
-        if metadata.is_dir() {
+        if metadata.is_dir() && path.extension().is_some_and(|ext| ext == "logarchive") {
+            if extensions
+                .as_ref()
+                .is_none_or(|exts| exts.contains("logarchive"))
+            {
+                files.push(path.clone());
+            }
+        } else if metadata.is_dir() {
             let directory = match path.read_dir() {
                 Ok(directory) => directory,
                 Err(e) => {
@@ -483,6 +566,15 @@ pub fn get_files(
             {
                 files.push(path.to_path_buf());
             }
+            if path.extension().is_none()
+                && e.contains("syslog")
+                && matches!(
+                    path.file_name().and_then(|s| s.to_str()),
+                    Some("syslog" | "messages" | "secure")
+                )
+            {
+                files.push(path.clone());
+            }
             // Edge cases
             if e.contains("$MFT") && path.file_name().and_then(|e| e.to_str()) == Some("$MFT") {
                 files.push(path.to_path_buf());
@@ -501,4 +593,11 @@ pub fn get_files(
 pub fn win32_ts_to_datetime(ts_win32: u64) -> crate::Result<DateTime<Utc>> {
     let ts_unix = (ts_win32 / 10_000) as i64 - 11644473600000;
     DateTime::from_timestamp_millis(ts_unix).ok_or(anyhow!("Timestamp out of range!"))
+}
+
+/// Event timestamps are returned as UTC for the hunt and search time filters.
+pub(crate) fn event_time(text: &str) -> Result<chrono::NaiveDateTime, chrono::ParseError> {
+    DateTime::parse_from_rfc3339(text)
+        .or_else(|_| DateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f%z"))
+        .map(|time| time.naive_utc())
 }

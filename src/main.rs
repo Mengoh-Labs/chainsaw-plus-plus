@@ -687,12 +687,23 @@ fn run() -> Result<()> {
             for path in &sigma {
                 for file in get_files(path, &None, skip_errors)? {
                     cs_debug!("[*] Loading sigma rule - {}", file.display());
-                    match load_rule(RuleKind::Sigma, &file, &kinds, &levels, &statuses) {
+                    match chainsaw::rule::load_for_hunt(
+                        RuleKind::Sigma,
+                        &file,
+                        &kinds,
+                        &levels,
+                        &statuses,
+                    ) {
                         Ok(r) => {
                             if !r.is_empty() {
                                 count += r.len();
                                 rs.extend(r)
                             }
+                        }
+                        Err(error) if error.is::<chainsaw::rule::CorrelationError>() => {
+                            return Err(error).with_context(|| {
+                                format!("Invalid Sigma correlation in {}", file.display())
+                            });
                         }
                         Err(_) => {
                             failed += 1;
@@ -808,6 +819,7 @@ fn run() -> Result<()> {
                 args.verbose != 0,
                 "Hunting".to_string(),
             );
+            let mut correlations = hunter.correlation_state();
             for file in &files {
                 cs_debug!("[*] Hunting through file - {}", file.display());
                 pb.set_message(format!("[+] Current Artifact: {}\n", file.display()));
@@ -821,7 +833,7 @@ fn run() -> Result<()> {
                 } else {
                     None
                 };
-                let scratch = hunter.hunt(file, &cache).with_context(|| {
+                let scratch = hunter.hunt_with_state(file, &cache, &mut correlations).with_context(|| {
                     format!("Failed to hunt through file '{}' (Use --skip-errors to continue processing)", file.to_string_lossy())
                 })?;
                 hits += scratch.iter().map(|d| d.hits.len()).sum::<usize>();
@@ -839,6 +851,21 @@ fn run() -> Result<()> {
                     detections.extend(scratch);
                 }
                 pb.inc(1);
+            }
+            let correlated = hunter.finish_correlations(correlations)?;
+            hits += correlated.iter().map(|d| d.hits.len()).sum::<usize>();
+            documents += correlated.len();
+            if jsonl {
+                cli::print_jsonl(
+                    &correlated,
+                    hunter.hunts(),
+                    hunter.rules(),
+                    local,
+                    timezone,
+                    None,
+                )?;
+            } else {
+                detections.extend(correlated);
             }
             pb.finish();
             if csv {

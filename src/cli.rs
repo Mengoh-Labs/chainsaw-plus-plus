@@ -8,10 +8,10 @@ use chrono::{DateTime, Local, NaiveDateTime, SecondsFormat, TimeZone, Utc};
 use chrono_tz::Tz;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use prettytable::{Row, Table, cell, format};
-use rustc_hash::FxHashMap;
+
 use serde::Serialize;
 use serde_json::{Map, Number, Value as Json, value::RawValue};
-use tau_engine::{Document, Value as Tau};
+use tau_engine::{AsValue, Document, Value as Tau};
 use uuid::Uuid;
 
 use crate::analyse::shimcache::{TimelineEntity, TimelineTimestamp, TimestampType};
@@ -130,115 +130,86 @@ pub struct Hit<'a> {
     rule: &'a Rule,
 }
 
-// HACK: Don't do this at home... its mega slow, but due to prior abstractions and optimisations, this
-// is the only way to consolidate aggregates for now
+// Materialize display columns after applying each contributing record's own
+// mapping. Projected columns are display names, not nested source paths.
 fn agg_to_doc<'a>(
-    hunts: &[&Hunt],
+    fallback: &Hunt,
+    hunts: &HashMap<&Uuid, &Hunt>,
     documents: &[crate::hunt::Document<'a>],
 ) -> crate::Result<crate::hunt::Document<'a>> {
-    let mut scratch: HashMap<String, HashSet<String>> = HashMap::default();
-    for hunt in hunts {
-        let fields = hunt.mapper.fields();
-        for document in documents {
-            let data: Value;
-            let wrapper;
-            let mapped = match &document.kind {
-                FileKind::Evtx => {
-                    (data, _) = bincode::serde::decode_from_slice::<Value, _>(
-                        &document.data,
-                        bincode::config::standard(),
-                    )?;
-                    wrapper = crate::evtx::Wrapper(&data);
-                    hunt.mapper.mapped(&wrapper)
-                }
-                FileKind::Hve
-                | FileKind::Json
-                | FileKind::Jsonl
-                | FileKind::Mft
-                | FileKind::Xml
-                | FileKind::Esedb => {
-                    (data, _) = bincode::serde::decode_from_slice::<Value, _>(
-                        &document.data,
-                        bincode::config::standard(),
-                    )?;
-                    hunt.mapper.mapped(&data)
-                }
-                FileKind::Unknown => continue,
-            };
-            for field in fields {
-                if field.visible
-                    && let Some(value) = mapped.find(&field.from)
-                {
-                    let entry = scratch
-                        .entry(field.from.clone())
-                        .or_insert(HashSet::with_capacity(documents.len()));
-                    match value.to_string() {
-                        Some(v) => {
-                            entry.insert(v);
-                        }
-                        None => {
-                            entry.insert("<see raw event>".to_string());
-                        }
-                    }
-                }
+    let mut columns: BTreeMap<String, std::collections::BTreeSet<String>> = BTreeMap::new();
+    for document in documents {
+        let hunt = document
+            .source_hunt
+            .and_then(|id| hunts.get(&id).copied())
+            .unwrap_or(fallback);
+        let (data, _) = bincode::serde::decode_from_slice::<Value, _>(
+            &document.data,
+            bincode::config::standard(),
+        )?;
+        let wrapper;
+        let mapped = if document.kind == FileKind::Evtx {
+            wrapper = crate::evtx::Wrapper(&data);
+            hunt.mapper.mapped(&wrapper)
+        } else {
+            hunt.mapper.mapped(&data)
+        };
+        for field in hunt.mapper.fields().iter().filter(|f| f.visible) {
+            if let Some(value) = mapped.find(&field.from) {
+                let text = value
+                    .to_string()
+                    .unwrap_or_else(|| tau_to_json(value).to_string());
+                columns.entry(field.name.clone()).or_default().insert(text);
             }
         }
     }
-    let first = documents.first().expect("missing document");
-    let mut doc: FxHashMap<String, Value> = FxHashMap::default();
-    let mut keys = scratch.keys().collect::<Vec<_>>();
-    keys.sort();
-    for k in keys {
-        let v = scratch.get(k).expect("could not get value");
-        let mut v = v.iter().cloned().collect::<Vec<_>>();
-        v.sort();
-        // NOTE: Lazy way of re-nesting object...
-        let mut parts = k.split('.').peekable();
-        let mut entry = doc
-            .entry(parts.next().expect("missing key").to_owned())
-            .or_insert(Value::Object(FxHashMap::default()));
-        while let Some(part) = parts.next() {
-            if let Value::Object(o) = entry {
-                if parts.peek().is_none() {
-                    if part.ends_with(']') && part.contains('[') {
-                        let mut ki = part.split('[');
-                        let k = ki.next().expect("missing key");
-                        let i: usize = match ki
-                            .next()
-                            .and_then(|i| i.strip_suffix(']'))
-                            .and_then(|i| i.parse::<usize>().ok())
-                        {
-                            Some(i) => i,
-                            None => break,
-                        };
-                        if let Value::Array(vec) =
-                            o.entry(k.to_owned()).or_insert(Value::Array(vec![]))
-                        {
-                            for _ in 0..(i - vec.len()) {
-                                vec.push(Value::Null);
-                            }
-                            vec.push(Value::String(v.join(", ")));
-                        }
-                    } else {
-                        o.insert(part.to_owned(), Value::String(v.join(", ")));
-                    }
-                    break;
-                } else {
-                    entry = o
-                        .entry(part.to_owned())
-                        .or_insert(Value::Object(FxHashMap::default()));
-                }
-            } else {
-                break;
-            }
-        }
-    }
+    let fields = columns
+        .into_iter()
+        .map(|(k, values)| {
+            (
+                k,
+                Value::String(values.into_iter().collect::<Vec<_>>().join(", ")),
+            )
+        })
+        .collect();
+    let first = documents
+        .first()
+        .ok_or_else(|| anyhow!("missing aggregate document"))?;
     Ok(crate::hunt::Document {
+        record_index: None,
+        source_hunt: None,
         kind: first.kind.clone(),
         path: first.path,
-        data: bincode::serde::encode_to_vec(Value::Object(doc), bincode::config::standard())
-            .expect("could not serialise collated documents"),
+        data: bincode::serde::encode_to_vec(Value::Object(fields), bincode::config::standard())?,
     })
+}
+
+fn printed_value<'a>(
+    kind: &Kind,
+    data: &'a Value,
+    mapped: &'a dyn Document,
+    field: &crate::rule::chainsaw::Field,
+) -> Option<Tau<'a>> {
+    if matches!(kind, Kind::Aggregate { .. }) {
+        if let Value::Object(fields) = data {
+            return fields.get(&field.name).map(AsValue::as_value);
+        }
+        return None;
+    }
+    mapped.find(&field.from)
+}
+
+fn source_records(kind: &Kind) -> Vec<String> {
+    match kind {
+        Kind::Aggregate { documents } => documents
+            .iter()
+            .filter_map(|d| {
+                d.record_index
+                    .map(|i| format!("{}#{}", d.path.display(), i))
+            })
+            .collect(),
+        _ => vec![],
+    }
 }
 
 pub fn print_log(
@@ -287,23 +258,21 @@ pub fn print_log(
             }
             Kind::Aggregate { documents } => {
                 count = documents.len();
-                agg = agg_to_doc(&[hunt], documents)?;
+                agg = agg_to_doc(hunt, &hunts, documents)?;
                 &agg
             }
             _ => unimplemented!(),
         };
 
-        let name = match rule {
-            Rule::Chainsaw(rule) => {
-                columns.push("c".to_string());
-                &rule.name
+        columns.push(
+            if rule.is_kind(&RuleKind::Sigma) {
+                "σ"
+            } else {
+                "c"
             }
-            Rule::Sigma(rule) => {
-                columns.push("σ".to_string());
-                &rule.name
-            }
-        };
-        columns.push(name.to_string());
+            .into(),
+        );
+        columns.push(rule.name().clone());
         columns.push(format!("{}", count));
 
         let mut values = vec![];
@@ -334,7 +303,7 @@ pub fn print_log(
         };
         for field in hunt.mapper.fields() {
             if field.visible
-                && let Some(value) = mapped.find(&field.from)
+                && let Some(value) = printed_value(kind, &data, &mapped, field)
             {
                 match value.to_string() {
                     Some(v) => {
@@ -347,6 +316,10 @@ pub fn print_log(
             }
         }
         columns.push(values.join("  ::  "));
+        let records = source_records(kind);
+        if !records.is_empty() {
+            columns.push(records.join(", "));
+        }
 
         println!("{}", columns.join("  |  "));
     }
@@ -431,6 +404,7 @@ pub fn print_detections(
     for key in keys {
         let mut group = groups.remove(&key).expect("could not get grouping!");
         group.sort_by(|x, y| x.timestamp.cmp(y.timestamp));
+        let show_records = group.iter().any(|g| matches!(&g.kind, Kind::Aggregate { documents } if documents.iter().any(|d| d.record_index.is_some())));
 
         let mut table = Table::new();
         table.set_format(format);
@@ -446,6 +420,9 @@ pub fn print_detections(
                 for header in &headers {
                     cells.push(cell!(header).style_spec("c"));
                 }
+            }
+            if show_records {
+                cells.push(cell!("source records").style_spec("c"));
             }
             table.add_row(Row::new(cells));
 
@@ -469,8 +446,8 @@ pub fn print_detections(
                     }
                     Kind::Aggregate { documents } => {
                         count = documents.len();
-                        let hunts = grouping.hits.iter().map(|h| h.hunt).collect::<Vec<_>>();
-                        agg = agg_to_doc(&hunts, documents).expect("could not collate aggregates");
+                        agg = agg_to_doc(grouping.hits[0].hunt, &hunts, documents)
+                            .expect("could not collate aggregates");
                         &agg
                     }
                     _ => unimplemented!(),
@@ -529,7 +506,9 @@ pub fn print_detections(
                         let mut hasher = DefaultHasher::new();
                         for header in &headers {
                             if let Some(field) = fields.get(header) {
-                                if let Some(value) = mapped.find(&field.from) {
+                                if let Some(value) =
+                                    printed_value(grouping.kind, &data, &mapped, field)
+                                {
                                     match value.to_string() {
                                         Some(v) => {
                                             v.hash(&mut hasher);
@@ -584,26 +563,17 @@ pub fn print_detections(
                             cell!("status").style_spec("c"),
                         ]));
                         for rule in &rules {
-                            match rule {
-                                Rule::Chainsaw(c) => {
-                                    table.add_row(Row::new(vec![
-                                        cell!('c'),
-                                        cell!(split_tag(&c.name)),
-                                        cell!(c.authors.join("\n")),
-                                        cell!(c.level),
-                                        cell!(c.status),
-                                    ]));
-                                }
-                                Rule::Sigma(s) => {
-                                    table.add_row(Row::new(vec![
-                                        cell!('σ'),
-                                        cell!(split_tag(&s.name)),
-                                        cell!(s.authors.join("\n")),
-                                        cell!(s.level),
-                                        cell!(s.status),
-                                    ]));
-                                }
-                            }
+                            table.add_row(Row::new(vec![
+                                cell!(if rule.is_kind(&RuleKind::Sigma) {
+                                    'σ'
+                                } else {
+                                    'c'
+                                }),
+                                cell!(split_tag(rule.name())),
+                                cell!(rule.authors().join("\n")),
+                                cell!(rule.level()),
+                                cell!(rule.status()),
+                            ]));
                         }
                         cells.push(cell!(table));
                     } else {
@@ -616,6 +586,9 @@ pub fn print_detections(
                         ));
                     }
                     cells.extend(row);
+                    if show_records {
+                        cells.push(cell!(source_records(grouping.kind).join("\n")));
+                    }
                     table.add_row(Row::new(cells));
                 }
             }
@@ -835,6 +808,7 @@ pub fn print_csv(
     for key in keys {
         let mut group = groups.remove(&key).expect("could not get grouping!");
         group.sort_by(|x, y| x.timestamp.cmp(y.timestamp));
+        let show_records = group.iter().any(|g| matches!(&g.kind, Kind::Aggregate { documents } if documents.iter().any(|d| d.record_index.is_some())));
 
         // FIXME: Handle name clashes
         let filename = format!("{}.csv", key.replace(' ', "_").to_lowercase());
@@ -850,6 +824,9 @@ pub fn print_csv(
                 for header in &headers {
                     cells.push(header);
                 }
+            }
+            if show_records {
+                cells.push("source records");
             }
             csv.write_record(cells)?;
 
@@ -871,8 +848,7 @@ pub fn print_csv(
                     }
                     Kind::Aggregate { documents } => {
                         count = documents.len();
-                        let hunts = grouping.hits.iter().map(|h| h.hunt).collect::<Vec<_>>();
-                        agg = agg_to_doc(&hunts, documents)?;
+                        agg = agg_to_doc(grouping.hits[0].hunt, &hunts, documents)?;
                         &agg
                     }
                     _ => unimplemented!(),
@@ -927,7 +903,9 @@ pub fn print_csv(
                         let mut hasher = DefaultHasher::new();
                         for header in &headers {
                             if let Some(field) = fields.get(header) {
-                                if let Some(value) = mapped.find(&field.from) {
+                                if let Some(value) =
+                                    printed_value(grouping.kind, &data, &mapped, field)
+                                {
                                     match value.to_string() {
                                         Some(v) => {
                                             v.hash(&mut hasher);
@@ -969,6 +947,9 @@ pub fn print_csv(
                     );
                     cells.push(document.path.to_string_lossy().to_string());
                     cells.extend(row);
+                    if show_records {
+                        cells.push(source_records(grouping.kind).join(", "));
+                    }
                     csv.write_record(cells)?;
                 }
             }
@@ -1008,6 +989,36 @@ pub struct Sigma<'a> {
     pub tags: &'a Option<Vec<String>>,
 }
 
+fn detection<'a>(
+    hunt: &'a Hunt,
+    rule: &'a Rule,
+    kind: &'a Kind<'a>,
+    timestamp: String,
+) -> Detection<'a> {
+    let sigma = rule.sigma_metadata().map(|s| Sigma {
+        falsepositives: &s.falsepositives,
+        id: &s.id,
+        logsource: &s.logsource,
+        references: &s.references,
+        tags: &s.tags,
+    });
+    Detection {
+        authors: rule.authors(),
+        group: &hunt.group,
+        kind,
+        level: rule.level(),
+        name: rule.name(),
+        source: if sigma.is_some() {
+            RuleKind::Sigma
+        } else {
+            RuleKind::Chainsaw
+        },
+        status: rule.status(),
+        timestamp,
+        sigma,
+    }
+}
+
 pub fn print_json(
     detections: &[Detections],
     hunts: &[Hunt],
@@ -1030,41 +1041,7 @@ pub fn print_json(
                 } else {
                     Utc.from_utc_datetime(&hit.timestamp).to_rfc3339()
                 };
-                match rule {
-                    Rule::Chainsaw(c) => detections.push(Detection {
-                        authors: &c.authors,
-                        group: &hunt.group,
-                        kind: &d.kind,
-                        level: &c.level,
-                        name: &c.name,
-                        source: RuleKind::Chainsaw,
-                        status: &c.status,
-                        timestamp: localised,
-
-                        sigma: None,
-                    }),
-                    Rule::Sigma(s) => {
-                        let sigma = Sigma {
-                            falsepositives: &s.falsepositives,
-                            id: &s.id,
-                            logsource: &s.logsource,
-                            references: &s.references,
-                            tags: &s.tags,
-                        };
-                        detections.push(Detection {
-                            authors: &s.authors,
-                            group: &hunt.group,
-                            kind: &d.kind,
-                            level: &s.level,
-                            name: &s.name,
-                            source: RuleKind::Sigma,
-                            status: &s.status,
-                            timestamp: localised,
-
-                            sigma: Some(sigma),
-                        })
-                    }
-                }
+                detections.push(detection(hunt, rule, &d.kind, localised));
             }
             detections
         })
@@ -1107,41 +1084,7 @@ pub fn print_jsonl(
         for (localised, hit, d) in hits {
             let hunt = hunts.get(&hit.hunt).expect("could not get rule!");
             let rule = rules.get(&hit.rule).expect("could not get rule!");
-            let det = match rule {
-                Rule::Chainsaw(c) => Detection {
-                    authors: &c.authors,
-                    group: &hunt.group,
-                    kind: &d.kind,
-                    level: &c.level,
-                    name: &c.name,
-                    source: RuleKind::Chainsaw,
-                    status: &c.status,
-                    timestamp: localised,
-
-                    sigma: None,
-                },
-                Rule::Sigma(s) => {
-                    let sigma = Sigma {
-                        falsepositives: &s.falsepositives,
-                        id: &s.id,
-                        logsource: &s.logsource,
-                        references: &s.references,
-                        tags: &s.tags,
-                    };
-                    Detection {
-                        authors: &s.authors,
-                        group: &hunt.group,
-                        kind: &d.kind,
-                        level: &s.level,
-                        name: &s.name,
-                        source: RuleKind::Sigma,
-                        status: &s.status,
-                        timestamp: localised,
-
-                        sigma: Some(sigma),
-                    }
-                }
-            };
+            let det = detection(hunt, rule, &d.kind, localised);
             match det.kind {
                 Kind::Cached {
                     document,
@@ -1185,41 +1128,7 @@ pub fn print_jsonl(
         for (localised, hit, d) in hits {
             let hunt = hunts.get(&hit.hunt).expect("could not get rule!");
             let rule = rules.get(&hit.rule).expect("could not get rule!");
-            let det = match rule {
-                Rule::Chainsaw(c) => Detection {
-                    authors: &c.authors,
-                    group: &hunt.group,
-                    kind: &d.kind,
-                    level: &c.level,
-                    name: &c.name,
-                    source: RuleKind::Chainsaw,
-                    status: &c.status,
-                    timestamp: localised,
-
-                    sigma: None,
-                },
-                Rule::Sigma(s) => {
-                    let sigma = Sigma {
-                        falsepositives: &s.falsepositives,
-                        id: &s.id,
-                        logsource: &s.logsource,
-                        references: &s.references,
-                        tags: &s.tags,
-                    };
-                    Detection {
-                        authors: &s.authors,
-                        group: &hunt.group,
-                        kind: &d.kind,
-                        level: &s.level,
-                        name: &s.name,
-                        source: RuleKind::Sigma,
-                        status: &s.status,
-                        timestamp: localised,
-
-                        sigma: Some(sigma),
-                    }
-                }
-            };
+            let det = detection(hunt, rule, &d.kind, localised);
             cs_print_json!(&det)?;
             cs_println!();
         }

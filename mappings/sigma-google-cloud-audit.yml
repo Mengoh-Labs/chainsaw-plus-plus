@@ -1,0 +1,26 @@
+---
+name: Google Cloud Audit Logs
+kind: json
+rules: sigma
+
+groups:
+  - name: Google Cloud Audit Logs
+    timestamp: timestamp
+    filter:
+      payloadType: type.googleapis.com/google.cloud.audit.AuditLog
+    fields:
+      - from: payloadType
+        to: protoPayload.@type
+        visible: false
+      - from: serviceName
+        to: protoPayload.serviceName
+      - from: methodName
+        to: protoPayload.methodName
+      - from: gcp.audit.method_name
+        to: protoPayload.methodName
+        visible: false
+      - from: principalEmail
+        to: protoPayload.authenticationInfo.principalEmail
+      - from: resourceName
+        to: protoPayload.resourceName
+      - name: insertId
